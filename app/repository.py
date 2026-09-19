@@ -177,16 +177,37 @@ def build_repository(
     marker 语法非法或引用越界变量时抛 SnapshotError（API 层映射为 422）。
 
     候选列表顺序无关，内部按 PEP 440 版本降序排列，保证解析确定性。
+
+    多个快照键按 PEP 503 规范化后可能同名（``Foo_Bar``、``foo.bar``、
+    ``foo-bar`` 都规范化为 ``foo-bar``）：这些键下的候选版本**合并到同一
+    个包**，一并参与 PEP 440 降序与全部端点，而不是后写覆盖先写。同一规范
+    化版本在多个键（或同一键内）重复出现时，依赖声明（marker 按目标环境
+    过滤后）与元数据完全一致则去重；不一致则抛 SnapshotError。键的遍历按
+    规范化名与原始键文本排序，故合并结果与冲突报错都不随 JSON 键顺序变化。
     """
     try:
         env = build_environment(target_environment) if target_environment else None
     except MarkerError as exc:
         raise SnapshotError(str(exc)) from exc
-    packages: dict[str, list[Candidate]] = {}
 
-    for raw_name, raw_candidates in raw.items():
+    # 先汇总每个规范化名对应的全部原始键（排序后用于稳定的冲突提示），
+    # 使报错内容只取决于快照内容、与 JSON 键顺序无关。
+    alias_map: dict[str, list[str]] = {}
+    for raw_name in raw:
+        alias_map.setdefault(canonical(raw_name), []).append(raw_name)
+    for names in alias_map.values():
+        names.sort()
+
+    # 规范化名 -> 该包全部候选（Version -> Candidate），跨等价键合并。
+    buckets: dict[str, dict[Version, Candidate]] = {}
+
+    # 按 (规范化名, 原始键文本) 稳定遍历：等价键的候选进入同一桶，先/后写
+    # 不再互相覆盖；重复检测命中的第一个位置也与 JSON 键顺序无关。
+    ordered_names = sorted(raw, key=lambda name: (canonical(name), name))
+    for raw_name in ordered_names:
         cname = canonical(raw_name)
-        bucket: dict[Version, Candidate] = {}
+        bucket = buckets.setdefault(cname, {})
+        raw_candidates = raw[raw_name]
 
         for item in raw_candidates:
             version_text = item["version"].strip()
@@ -223,13 +244,23 @@ def build_repository(
             if version in bucket:
                 other = bucket[version]
                 if other.deps != deps or other.metadata != metadata:
+                    aliases = alias_map[cname]
+                    if len(aliases) > 1:
+                        keys_text = "、".join(repr(name) for name in aliases)
+                        raise SnapshotError(
+                            f"包 {cname!r} 的版本 {version} 在多个 PEP 503 等价键"
+                            f"（{keys_text}）下重复出现，但依赖声明或元数据不一致"
+                        )
                     raise SnapshotError(
                         f"包 {cname!r} 的版本 {version} 出现多次且依赖声明或元数据不一致"
                     )
-                # 完全重复则忽略
+                # 完全重复（同一键内或跨等价键）则忽略。
                 continue
             bucket[version] = candidate
 
+    packages: dict[str, list[Candidate]] = {}
+    for cname in sorted(buckets):
+        bucket = buckets[cname]
         # PEP 440 降序：候选总是从高到低尝试。
         packages[cname] = [bucket[v] for v in sorted(bucket, reverse=True)]
 

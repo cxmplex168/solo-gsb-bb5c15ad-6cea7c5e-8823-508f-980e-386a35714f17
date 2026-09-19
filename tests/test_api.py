@@ -335,3 +335,152 @@ def test_environment_values_taken_from_request_not_host():
         repository=repo, target_environment=env))
     assert r.status_code == 200, r.text
     assert "win-only" in r.json()["locked"]
+
+
+# --------------------------------------------------------------------- #
+# PEP 503 等价包名键合并（Foo_Bar / foo.bar / foo-bar 规范化同名）
+# --------------------------------------------------------------------- #
+def _equivalent_key_repo(order):
+    """根 app 依赖 foo-bar>=2；候选版本分散在三个 PEP 503 等价键上。"""
+    keys = {
+        "app": [{"version": "1.0",
+                 "dependencies": [{"name": "Foo_Bar", "specifier": ">=2"}]}],
+        "Foo_Bar": [{"version": "2.0",
+                     "dependencies": [{"name": "only-in-2", "specifier": ""}]}],
+        "foo.bar": [{"version": "1.0"}, {"version": "3.0"}],
+        "foo---bar": [{"version": "2.5"}],
+        "only-in-2": [{"version": "1.0"}],
+    }
+    return {name: keys[name] for name in order}
+
+
+_KEY_ORDER_A = ["app", "Foo_Bar", "foo.bar", "foo---bar", "only-in-2"]
+_KEY_ORDER_B = ["only-in-2", "foo---bar", "foo.bar", "Foo_Bar", "app"]
+
+
+def test_resolve_merges_pep503_equivalent_keys():
+    r = client.post("/resolve", json=payload(repository=_equivalent_key_repo(_KEY_ORDER_A)))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # 跨键候选合并：最高 3.0 由 foo.bar 提供；2.0 的传递依赖不丢失
+    assert body["locked"] == {"app": "1.0", "foo-bar": "3.0"}
+
+
+def test_resolve_key_order_permutation_byte_for_byte():
+    r1 = client.post("/resolve", json=payload(repository=_equivalent_key_repo(_KEY_ORDER_A)))
+    r2 = client.post("/resolve", json=payload(repository=_equivalent_key_repo(_KEY_ORDER_B)))
+    assert r1.status_code == r2.status_code == 200
+    assert r1.json() == r2.json()
+
+
+def test_resolve_cross_key_same_version_conflict_422_stable():
+    def conflict_repo(first, second):
+        keys = {
+            "app": [{"version": "1.0"}],
+            first: [{"version": "1.0",
+                     "dependencies": [{"name": "x", "specifier": ""}]}],
+            second: [{"version": "1.0",
+                      "dependencies": [{"name": "y", "specifier": ""}]}],
+            "x": [{"version": "1.0"}],
+            "y": [{"version": "1.0"}],
+        }
+        return keys
+
+    bodies = []
+    for order in (("Foo_Bar", "foo.bar"), ("foo.bar", "Foo_Bar")):
+        r = client.post("/resolve", json=payload(repository=conflict_repo(*order)))
+        assert r.status_code == 422
+        body = r.json()
+        assert body["status"] == "invalid_snapshot"
+        bodies.append(body)
+    # 422 报错不随 JSON 键顺序变化
+    assert bodies[0] == bodies[1]
+    assert "'Foo_Bar'" in bodies[0]["message"] and "'foo.bar'" in bodies[0]["message"]
+
+
+def test_resolve_cross_key_identical_version_deduplicated_200():
+    repo = {
+        "app": [{"version": "1.0",
+                 "dependencies": [{"name": "foo.bar", "specifier": ">=1"}]}],
+        "Foo_Bar": [{"version": "1.0",
+                     "dependencies": [{"name": "shared-dep", "specifier": ">=1"}]}],
+        "foo.bar": [{"version": "1.0",
+                     "dependencies": [{"name": "shared-dep", "specifier": ">=1"}]}],
+        "shared-dep": [{"version": "1.0"}, {"version": "2.0"}],
+    }
+    r = client.post("/resolve", json=payload(repository=repo))
+    assert r.status_code == 200, r.text
+    assert r.json()["locked"] == {"app": "1.0", "foo-bar": "1.0", "shared-dep": "2.0"}
+
+
+def test_matrix_marker_filtered_merge_across_equivalent_keys():
+    """跨环境矩阵：等价键中按 marker 激活的候选合并，不同环境锁定不同版本。"""
+    repo = {
+        # app 2.0 只声明在 app 键；1.0 声明在等价键 APP
+        "app": [{"version": "2.0",
+                 "dependencies": [{"name": "linux-only",
+                                   "marker": "sys_platform == 'linux'"}]}],
+        "linux-only": [{"version": "1.0"}],
+    }
+    body = {
+        "repository": repo,
+        "root": "App",  # 根名也走 PEP 503 规范化
+        "specifier": "",
+        "allow_prereleases": False,
+        "target_environments": [
+            {"id": "win", "python_version": "3.11",
+             "sys_platform": "win32", "platform_machine": "AMD64"},
+            {"id": "linux", "python_version": "3.11",
+             "sys_platform": "linux", "platform_machine": "x86_64"},
+        ],
+    }
+    r = client.post("/resolve-matrix", json=body)
+    assert r.status_code == 200, r.text
+    results = {row["id"]: row["locked"] for row in r.json()["results"]}
+    assert results["linux"] == {"app": "2.0", "linux-only": "1.0"}
+    assert results["win"] == {"app": "2.0"}
+
+
+def test_sbom_merges_candidates_across_equivalent_keys():
+    """同一版本的元数据在等价键间合并后，/sbom 能审计通过并导出元数据。"""
+    meta = {"source_url": "https://example.invalid/foo-1.0.tar.gz",
+            "sha256": "a" * 64, "license": "MIT"}
+    repo = {
+        "app": [{"version": "1.0",
+                 "dependencies": [{"name": "foo.bar", "specifier": ""}]}],
+        "Foo_Bar": [{"version": "1.0", "metadata": meta}],
+        "foo.bar": [{"version": "1.0", "metadata": meta}],  # 完全重复去重
+    }
+    body = {
+        "repository": repo,
+        "root": "app",
+        "specifier": "",
+        "allow_prereleases": False,
+        "target_environment": LINUX_X64_PY311,
+        "current_lock": {"app": "1.0", "foo-bar": "1.0"},
+    }
+    r = client.post("/sbom", json=body)
+    assert r.status_code == 200, r.text
+    packages = {p["name"]: p for p in r.json()["packages"]}
+    assert packages["foo-bar"]["metadata"]["license"] == "MIT"
+    # foo-bar 元数据齐全：不产生 warning（app 未给元数据，与本次合并无关）
+    assert all(w["name"] != "foo-bar" for w in r.json()["warnings"])
+
+
+def test_sbom_cross_key_metadata_conflict_422():
+    repo = {
+        "app": [{"version": "1.0"}],
+        "Foo_Bar": [{"version": "1.0", "metadata": {"license": "MIT"}}],
+        "foo.bar": [{"version": "1.0", "metadata": {"license": "GPL-2.0-only"}}],
+    }
+    body = {
+        "repository": repo,
+        "root": "app",
+        "specifier": "",
+        "allow_prereleases": False,
+        "target_environment": LINUX_X64_PY311,
+        "current_lock": {"app": "1.0"},
+    }
+    r = client.post("/sbom", json=body)
+    assert r.status_code == 422
+    assert r.json()["status"] == "invalid_snapshot"
