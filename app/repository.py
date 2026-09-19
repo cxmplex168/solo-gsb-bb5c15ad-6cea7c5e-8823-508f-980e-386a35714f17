@@ -171,6 +171,12 @@ def build_repository(
     供 POST /sbom 导出；三项均可缺省，但非空值必须合法（否则抛
     SnapshotError）。marker 等其余规则见下。
 
+    PEP 503 规范化后同名的多个快照键（如 ``Foo_Bar`` 与 ``foo.bar``）视为
+    **同一个包**：各键下的候选版本合并进同一个候选集，再按 PEP 440 降序
+    排列；合并后同一规范化版本的依赖与元数据完全一致时去重为一条候选，
+    不一致时抛 SnapshotError（API 层映射为 422）。原始键按稳定排序处理，
+    因此合并结果、去重与冲突报错都不随 JSON 键顺序变化。
+
     ``target_environment`` 提供 ``python_version`` / ``sys_platform`` /
     ``platform_machine`` 三个键；每条依赖的 PEP 508 marker 在该环境下求值，
     **仅激活的依赖**会进入快照（环境值全部来自请求，不读取宿主机）。
@@ -182,11 +188,16 @@ def build_repository(
         env = build_environment(target_environment) if target_environment else None
     except MarkerError as exc:
         raise SnapshotError(str(exc)) from exc
-    packages: dict[str, list[Candidate]] = {}
+    # 先按规范化名收集“版本 -> 候选”桶；跨 PEP 503 等价键（Foo_Bar 与
+    # foo.bar 等）合并进同一个桶，而不是后写覆盖先写。
+    packages: dict[str, dict[Version, Candidate]] = {}
 
-    for raw_name, raw_candidates in raw.items():
+    # 按原始键名稳定排序后处理：跨等价键的候选合并、同版本去重/冲突检查
+    # 及其报错内容均与 JSON 键顺序无关。
+    for raw_name in sorted(raw):
+        raw_candidates = raw[raw_name]
         cname = canonical(raw_name)
-        bucket: dict[Version, Candidate] = {}
+        bucket = packages.setdefault(cname, {})
 
         for item in raw_candidates:
             version_text = item["version"].strip()
@@ -230,10 +241,13 @@ def build_repository(
                 continue
             bucket[version] = candidate
 
-        # PEP 440 降序：候选总是从高到低尝试。
-        packages[cname] = [bucket[v] for v in sorted(bucket, reverse=True)]
-
-    return Repository(packages)
+    # PEP 440 降序：候选总是从高到低尝试。跨等价键合并后的候选集在此统一
+    # 排序，与候选来自哪个原始键、键的 JSON 顺序均无关。
+    merged: dict[str, list[Candidate]] = {
+        cname: [bucket[v] for v in sorted(bucket, reverse=True)]
+        for cname, bucket in packages.items()
+    }
+    return Repository(merged)
 
 
 def parse_root_specifier(raw: str) -> SpecifierSet:
